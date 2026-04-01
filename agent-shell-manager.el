@@ -38,6 +38,7 @@
 ;;   M     - Set session model
 ;;   C-c C-c - Interrupt agent
 ;;   t     - View traffic logs
+;;   n     - Set display label for buffer
 ;;   l     - Toggle logging
 ;;   p     - Enter preview mode
 ;;   f     - Cycle status filter
@@ -108,6 +109,10 @@ Automatically set to the previously-active frame when
     map)
   "Keymap for `agent-shell-manager-mode'.")
 
+(with-eval-after-load 'evil
+  (evil-define-key 'normal agent-shell-manager-mode-map
+    "n" #'agent-shell-manager-set-label))
+
 (defvar-local agent-shell-manager--refresh-timer nil
   "Timer for auto-refreshing the buffer list.")
 
@@ -118,6 +123,15 @@ Automatically set to the previously-active frame when
   "Hook run after `agent-shell-manager-refresh' reprints the buffer.
 Preview mode uses this to re-sync overlay and preview pane after
 timer-driven refreshes (where `post-command-hook' does not fire).")
+
+;; ============================================================
+;; Buffer Labels (display names)
+;; ============================================================
+
+(defvar agent-shell-manager--labels (make-hash-table :test #'eq)
+  "Hash table mapping buffer objects to user-assigned display labels.
+Labels are shown in the Buffer column alongside the real buffer name,
+without actually renaming the buffer.")
 
 ;; ============================================================
 ;; Preview Mode
@@ -381,13 +395,18 @@ Applies status filtering. Killed buffers sort to bottom within each group."
          (entries (mapcar
                    (lambda (buffer)
                      (let* ((buffer-name (buffer-name buffer))
+                            (label (gethash buffer agent-shell-manager--labels))
+                            (display-name (if label
+                                              (propertize (format "%s (%s)" label buffer-name)
+                                                          'face 'font-lock-string-face)
+                                            buffer-name))
                             (status (agent-shell-manager--get-combined-status buffer))
                             (mode (agent-shell-manager--get-session-mode buffer))
                             (model (agent-shell-manager--get-model-id buffer))
                             (perms (agent-shell-manager--count-pending-permissions buffer))
                             (path (abbreviate-file-name (agent-shell-manager--get-cwd buffer))))
                        (list buffer
-                             (vector buffer-name status mode model perms path))))
+                             (vector display-name status mode model perms path))))
                    buffers))
          ;; Apply status filter
          (entries (if agent-shell-manager-filter-status
@@ -451,6 +470,27 @@ always sees the final cursor position (not an intermediate header line)."
         (when (eobp) (forward-line -1))))
     ;; Always update preview after cursor has settled
     (agent-shell-manager--preview-update)))
+
+;; ============================================================
+;; Buffer Label Commands
+;; ============================================================
+
+(defun agent-shell-manager-set-label ()
+  "Set a display label for the agent-shell buffer at point.
+The label is shown in the Buffer column without renaming the actual buffer.
+Enter an empty string to clear the label."
+  (interactive)
+  (let ((buffer (tabulated-list-get-id)))
+    (unless buffer
+      (user-error "No buffer on this line"))
+    (let* ((current-label (gethash buffer agent-shell-manager--labels))
+           (input (read-string
+                   (format "Label for %s: " (buffer-name buffer))
+                   current-label)))
+      (if (string-empty-p input)
+          (remhash buffer agent-shell-manager--labels)
+        (puthash buffer input agent-shell-manager--labels))
+      (agent-shell-manager-refresh))))
 
 ;; ============================================================
 ;; Refresh
