@@ -131,7 +131,32 @@ timer-driven refreshes (where `post-command-hook' does not fire).")
 (defvar agent-shell-manager--labels (make-hash-table :test #'eq)
   "Hash table mapping buffer objects to user-assigned display labels.
 Labels are shown in the Buffer column alongside the real buffer name,
-without actually renaming the buffer.")
+without actually renaming the buffer.  Only the default label functions
+use it; see `agent-shell-manager-label-function'.")
+
+(defun agent-shell-manager--own-label (buffer)
+  "Return BUFFER's label from the manager's own table, or nil."
+  (gethash buffer agent-shell-manager--labels))
+
+(defun agent-shell-manager--own-set-label (buffer label)
+  "Store LABEL for BUFFER in the manager's own table; nil or \"\" clears it."
+  (if (or (null label) (string-empty-p label))
+      (remhash buffer agent-shell-manager--labels)
+    (puthash buffer label agent-shell-manager--labels)))
+
+(defcustom agent-shell-manager-label-function #'agent-shell-manager--own-label
+  "Function called with a buffer that returns its display label, or nil.
+Point it at another package's labels so the manager shows the same
+names as the rest of your setup."
+  :type 'function
+  :group 'agent-shell-manager)
+
+(defcustom agent-shell-manager-set-label-function #'agent-shell-manager--own-set-label
+  "Function called with a buffer and a label to store it.
+A nil or empty label clears it.  Pair it with
+`agent-shell-manager-label-function'."
+  :type 'function
+  :group 'agent-shell-manager)
 
 ;; ============================================================
 ;; Preview Mode
@@ -395,7 +420,7 @@ Applies status filtering. Killed buffers sort to bottom within each group."
          (entries (mapcar
                    (lambda (buffer)
                      (let* ((buffer-name (buffer-name buffer))
-                            (label (gethash buffer agent-shell-manager--labels))
+                            (label (funcall agent-shell-manager-label-function buffer))
                             (display-name (if label
                                               (concat (propertize label 'face 'font-lock-string-face)
                                                       " (" buffer-name ")")
@@ -483,13 +508,11 @@ Enter an empty string to clear the label."
   (let ((buffer (tabulated-list-get-id)))
     (unless buffer
       (user-error "No buffer on this line"))
-    (let* ((current-label (gethash buffer agent-shell-manager--labels))
+    (let* ((current-label (funcall agent-shell-manager-label-function buffer))
            (input (read-string
                    (format "Label for %s: " (buffer-name buffer))
                    current-label)))
-      (if (string-empty-p input)
-          (remhash buffer agent-shell-manager--labels)
-        (puthash buffer input agent-shell-manager--labels))
+      (funcall agent-shell-manager-set-label-function buffer input)
       (agent-shell-manager-refresh))))
 
 ;; ============================================================
