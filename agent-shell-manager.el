@@ -397,8 +397,8 @@ Applies status filtering. Killed buffers sort to bottom within each group."
                      (let* ((buffer-name (buffer-name buffer))
                             (label (gethash buffer agent-shell-manager--labels))
                             (display-name (if label
-                                              (propertize (format "%s (%s)" label buffer-name)
-                                                          'face 'font-lock-string-face)
+                                              (concat (propertize label 'face 'font-lock-string-face)
+                                                      " (" buffer-name ")")
                                             buffer-name))
                             (status (agent-shell-manager--get-combined-status buffer))
                             (mode (agent-shell-manager--get-session-mode buffer))
@@ -511,6 +511,87 @@ Runs `agent-shell-manager-after-refresh-hook' so preview mode can re-sync."
       (when (bound-and-true-p hl-line-mode)
         (hl-line-highlight))
       (run-hooks 'agent-shell-manager-after-refresh-hook))))
+
+;; ============================================================
+;; Active Shell Tracking
+;; ============================================================
+
+(defface agent-shell-manager-active-highlight
+  '((t :inherit highlight :extend t))
+  "Face for the tracked active shell entry in the manager.
+Used when the manager does not have focus and is tracking the
+user's current agent-shell buffer.")
+
+(defvar agent-shell-manager--active-overlay nil
+  "Overlay used to highlight the tracked active shell entry.")
+
+(defun agent-shell-manager--goto-entry (target-buffer)
+  "Move point to the row for TARGET-BUFFER in the tabulated list.
+Return non-nil if found, nil otherwise."
+  (goto-char (point-min))
+  (let ((found nil))
+    (while (and (not found) (not (eobp)))
+      (when (eq (tabulated-list-get-id) target-buffer)
+        (setq found t))
+      (unless found
+        (forward-line 1)))
+    found))
+
+(defun agent-shell-manager--user-shell-buffer ()
+  "Return the agent-shell buffer the user is currently visiting, or nil.
+In cross-frame mode, inspects the target frame's selected window.
+In same-frame mode, inspects the frame showing the manager buffer."
+  (let* ((frame (cond
+                 ;; Cross-frame: user works in the target frame
+                 ((and agent-shell-manager--frame
+                       (frame-live-p agent-shell-manager--frame)
+                       (agent-shell-manager--target-frame-live-p))
+                  agent-shell-manager--target-frame)
+                 ;; Same-frame: the frame containing the manager
+                 (agent-shell-manager--global-buffer
+                  (when-let* ((win (get-buffer-window
+                                    agent-shell-manager--global-buffer t)))
+                    (window-frame win)))
+                 (t nil)))
+         (win (and frame (frame-selected-window frame)))
+         (buf (and win (window-buffer win))))
+    (when (and buf (buffer-live-p buf)
+               (with-current-buffer buf
+                 (derived-mode-p 'agent-shell-mode)))
+      buf)))
+
+(defun agent-shell-manager--track-active-shell ()
+  "Move the manager cursor to track the user's active agent-shell buffer.
+Runs after refresh.  Does nothing when preview mode is active,
+the manager has focus, or the user is not in an agent-shell buffer."
+  (when-let* ((mgr-buf agent-shell-manager--global-buffer)
+              ((buffer-live-p mgr-buf))
+              ((not agent-shell-manager-preview-active))
+              (shell-buf (agent-shell-manager--user-shell-buffer)))
+    (let ((mgr-has-focus
+           (cond
+            ;; Cross-frame: manager has focus if its frame is selected
+            ((and agent-shell-manager--frame
+                  (frame-live-p agent-shell-manager--frame))
+             (eq (selected-frame) agent-shell-manager--frame))
+            ;; Same-frame: manager has focus if its window is selected
+            (t (let ((mgr-win (get-buffer-window mgr-buf)))
+                 (and mgr-win (eq mgr-win (selected-window))))))))
+      (with-current-buffer mgr-buf
+        (if mgr-has-focus
+            ;; Manager has focus — remove tracking overlay, let hl-line do its thing
+            (when agent-shell-manager--active-overlay
+              (delete-overlay agent-shell-manager--active-overlay)
+              (setq agent-shell-manager--active-overlay nil))
+          ;; Manager doesn't have focus — track the active shell
+          (when (agent-shell-manager--goto-entry shell-buf)
+            (let ((beg (line-beginning-position))
+                  (end (1+ (line-end-position))))
+              (if agent-shell-manager--active-overlay
+                  (move-overlay agent-shell-manager--active-overlay beg end)
+                (setq agent-shell-manager--active-overlay (make-overlay beg end))
+                (overlay-put agent-shell-manager--active-overlay 'face 'agent-shell-manager-active-highlight)
+                (overlay-put agent-shell-manager--active-overlay 'priority 10)))))))))
 
 ;; ============================================================
 ;; Status Filtering UI
@@ -1079,6 +1160,9 @@ project grouping, and status filtering."
           (insert (format "test shell %d — %s (%d)" count label (1+ i))))))
     (agent-shell-manager-toggle)
     (message "Spawned %d test shells across %d projects." count (length projects))))
+
+(add-hook 'agent-shell-manager-after-refresh-hook
+          #'agent-shell-manager--track-active-shell)
 
 (provide 'agent-shell-manager)
 
