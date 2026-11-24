@@ -1,6 +1,6 @@
 ;;; agent-shell-manager.el --- Buffer manager for agent-shell -*- lexical-binding: t; -*-
 
-;; Package-Requires: ((emacs "29.1") (agent-shell "0.1"))
+;; Package-Requires: ((emacs "29.1") (agent-shell "0.86.1"))
 
 ;; Copyright (C) 2025 Jethro Kuan
 
@@ -234,72 +234,102 @@ A nil or empty label clears it.  Pair it with
             nil t))
 
 ;; ============================================================
+;; Agent-shell adapter
+;; ============================================================
+;;
+;; Everything this package knows about agent-shell goes through its
+;; public API (`agent-shell-status', `agent-shell-initialized-p',
+;; `agent-shell-session-id', `agent-shell-config-option',
+;; `agent-shell-display-action'), except the reads in this section.
+;; agent-shell has no public equivalent for them, so they touch
+;; `agent-shell--state' directly.  Keep every private read here so an
+;; agent-shell change breaks one place.
+
+(defun agent-shell-manager--state (buffer)
+  "Return BUFFER's private agent-shell state, or nil."
+  (and (buffer-live-p buffer)
+       (buffer-local-boundp 'agent-shell--state buffer)
+       (buffer-local-value 'agent-shell--state buffer)))
+
+(defun agent-shell-manager--agent-process (buffer)
+  "Return the agent (ACP) process for BUFFER, or nil.  Private read."
+  (map-nested-elt (agent-shell-manager--state buffer) '(:client :process)))
+
+(defun agent-shell-manager--agent-dead-p (buffer)
+  "Return non-nil when BUFFER had an agent process that is gone.  Private read."
+  (let ((state (agent-shell-manager--state buffer)))
+    (and (map-elt state :client)
+         (not (agent-shell-manager--process-alive-p
+               (agent-shell-manager--agent-process buffer))))))
+
+(defun agent-shell-manager--pending-permission-count (buffer)
+  "Return how many permission requests in BUFFER await an answer.  Private read."
+  (let ((count 0))
+    (map-do (lambda (_id tool-call)
+              (when (and (map-elt tool-call :permission-request-id)
+                         (equal (map-elt tool-call :status) "pending"))
+                (setq count (1+ count))))
+            (map-elt (agent-shell-manager--state buffer) :tool-calls))
+    count))
+
+(defun agent-shell-manager--state-option-name (buffer kind)
+  "Return BUFFER's mode or model name from private state, or nil.
+KIND is `mode' or `model'.  Fallback for agents that do not report
+the option through `agent-shell-config-option'.  Private read."
+  (when-let* ((state (agent-shell-manager--state buffer)))
+    (ignore-errors
+      (pcase kind
+        ('mode (agent-shell-get-mode-name state))
+        ('model (agent-shell-get-model-name state))))))
+
+;; ============================================================
 ;; Status Helpers
 ;; ============================================================
 
+(defun agent-shell-manager--process-alive-p (proc)
+  "Return non-nil when PROC is a live process."
+  (and (processp proc)
+       (process-live-p proc)
+       (memq (process-status proc) '(run open listen connect stop))))
+
+(cl-defun agent-shell-manager--status-from (&key shell-alive agent-dead initialized
+                                                 status session)
+  "Return the manager's status string from observed facts.
+SHELL-ALIVE: the shell buffer's process is live.  AGENT-DEAD: the agent
+process existed and is gone.  INITIALIZED: `agent-shell-initialized-p'.
+STATUS: `agent-shell-status'.  SESSION: a session id is present.
+Returns one of: killed, initializing, waiting, working, ready, unknown."
+  (cond
+   ((or (not shell-alive) agent-dead) "killed")
+   ((not initialized) "initializing")
+   ((eq status 'blocked) "waiting")
+   ((eq status 'busy) "working")
+   (session "ready")
+   (t "unknown")))
+
 (defun agent-shell-manager--get-status (buffer)
   "Get the current status of `agent-shell' BUFFER.
-Returns one of: waiting, ready, working, killed, or unknown."
-  (with-current-buffer buffer
-    (if (not (boundp 'agent-shell--state))
-        "unknown"
-      (let* ((state agent-shell--state)
-             (acp-proc (map-nested-elt state '(:client :process)))
-             (acp-process-alive (and acp-proc
-                                     (processp acp-proc)
-                                     (process-live-p acp-proc)
-                                     (memq (process-status acp-proc) '(run open listen connect stop))))
-             (comint-proc (get-buffer-process (current-buffer)))
-             (comint-process-alive (and comint-proc
-                                        (processp comint-proc)
-                                        (process-live-p comint-proc)
-                                        (memq (process-status comint-proc) '(run open listen connect stop))))
-             (process-alive (and acp-process-alive comint-process-alive)))
-        (cond
-         ((or (not comint-proc)
-              (and (processp comint-proc)
-                   (not comint-process-alive)))
-          "killed")
-         ((and (map-elt state :client)
-               (or (not acp-proc)
-                   (and (processp acp-proc)
-                        (not acp-process-alive))))
-          "killed")
-         ((and process-alive
-               (map-elt state :tool-calls)
-               (> (length (map-elt state :tool-calls)) 0))
-          (let ((has-pending-permission
-                 (seq-find (lambda (tool-call)
-                             (map-elt (cdr tool-call) :permission-request-id))
-                           (map-elt state :tool-calls))))
-            (if has-pending-permission
-                "waiting"
-              "working")))
-         ((and process-alive
-               (fboundp 'shell-maker-busy)
-               (shell-maker-busy))
-          "working")
-         ((and process-alive
-               (map-nested-elt state '(:session :id)))
-          "ready")
-         ((not (map-elt state :initialized))
-          "initializing")
-         (t "unknown"))))))
+Returns one of: killed, initializing, waiting, working, ready, unknown."
+  (if (not (and (buffer-live-p buffer)
+                (with-current-buffer buffer (derived-mode-p 'agent-shell-mode))))
+      "unknown"
+    (agent-shell-manager--status-from
+     :shell-alive (agent-shell-manager--process-alive-p (get-buffer-process buffer))
+     :agent-dead (agent-shell-manager--agent-dead-p buffer)
+     :initialized (ignore-errors (agent-shell-initialized-p :shell-buffer buffer))
+     :status (ignore-errors (agent-shell-status :shell-buffer buffer))
+     :session (ignore-errors (agent-shell-session-id :shell-buffer buffer)))))
 
 (defun agent-shell-manager--get-buffer-name (buffer)
   "Get the buffer name for BUFFER."
   (buffer-name buffer))
 
 (defun agent-shell-manager--get-session-status (buffer)
-  "Get session status for BUFFER."
-  (with-current-buffer buffer
-    (let ((status (agent-shell-manager--get-status buffer)))
-      (if (string= status "killed")
-          "none"
-        (if (and (boundp 'agent-shell--state)
-                 (map-nested-elt agent-shell--state '(:session :id)))
-            "active"
-          "none")))))
+  "Get session status for BUFFER: \"active\" or \"none\"."
+  (if (and (not (string= (agent-shell-manager--get-status buffer) "killed"))
+           (ignore-errors (agent-shell-session-id :shell-buffer buffer)))
+      "active"
+    "none"))
 
 (defun agent-shell-manager--get-combined-status (buffer)
   "Get combined status for BUFFER that merges operational and session state."
@@ -325,16 +355,26 @@ Returns one of: waiting, ready, working, killed, or unknown."
        (t
         (propertize "Unknown" 'face 'font-lock-comment-face))))))
 
+(defun agent-shell-manager--option-name (buffer category)
+  "Return the display name of BUFFER's current CATEGORY option, or nil.
+CATEGORY is an ACP config option category such as \"model\" or \"mode\".
+Uses the public `agent-shell-config-option'; a current value missing
+from the option's choices is returned as-is."
+  (when (ignore-errors (agent-shell-initialized-p :shell-buffer buffer))
+    (when-let* ((option (ignore-errors
+                          (agent-shell-config-option :shell-buffer buffer
+                                                     :category category)))
+                (value (map-elt option :current-value)))
+      (or (map-elt (seq-find (lambda (choice) (equal (map-elt choice :value) value))
+                             (map-elt option :options))
+                   :name)
+          value))))
+
 (defun agent-shell-manager--get-session-mode (buffer)
-  "Get the current session mode for BUFFER."
-  (with-current-buffer buffer
-    (if (and (boundp 'agent-shell--state)
-             (map-nested-elt agent-shell--state '(:session :mode-id)))
-        (or (agent-shell--resolve-session-mode-name
-             (map-nested-elt agent-shell--state '(:session :mode-id))
-             (map-nested-elt agent-shell--state '(:session :modes)))
-            "-")
-      "-")))
+  "Get the current session mode name for BUFFER, or \"-\"."
+  (or (agent-shell-manager--option-name buffer "mode")
+      (agent-shell-manager--state-option-name buffer 'mode)
+      "-"))
 
 (defun agent-shell-manager--get-agent-kind (buffer)
   "Get the agent kind for BUFFER by parsing the buffer name."
@@ -345,37 +385,18 @@ Returns one of: waiting, ready, working, killed, or unknown."
         "-"))))
 
 (defun agent-shell-manager--get-model-id (buffer)
-  "Get the current model ID for BUFFER."
-  (with-current-buffer buffer
-    (if (and (boundp 'agent-shell--state)
-             (map-nested-elt agent-shell--state '(:session :model-id)))
-        (let* ((model-id (map-nested-elt agent-shell--state '(:session :model-id)))
-               (models (map-nested-elt agent-shell--state '(:session :models)))
-               (model-info (seq-find (lambda (model)
-                                       (string= (map-elt model :model-id) model-id))
-                                     models)))
-          (or (and model-info (map-elt model-info :name))
-              model-id))
-      "-")))
+  "Get the current model name for BUFFER, or \"-\"."
+  (or (agent-shell-manager--option-name buffer "model")
+      (agent-shell-manager--state-option-name buffer 'model)
+      "-"))
 
 (defun agent-shell-manager--count-pending-permissions (buffer)
-  "Count the number of pending permission requests for BUFFER."
-  (with-current-buffer buffer
-    (if (and (boundp 'agent-shell--state)
-             (map-elt agent-shell--state :tool-calls))
-        (let ((count 0))
-          (map-do
-           (lambda (_tool-call-id tool-call-data)
-             (when (and (map-elt tool-call-data :permission-request-id)
-                        (let ((status (map-elt tool-call-data :status)))
-                          (equal status "pending")))
-               (setq count (1+ count))))
-           (map-elt agent-shell--state :tool-calls))
-          (if (> count 0)
-              (propertize (number-to-string count)
-                          'face 'warning
-                          'font-lock-face 'warning)
-            "-"))
+  "Count the pending permission requests for BUFFER, as a display string."
+  (let ((count (agent-shell-manager--pending-permission-count buffer)))
+    (if (> count 0)
+        (propertize (number-to-string count)
+                    'face 'warning
+                    'font-lock-face 'warning)
       "-")))
 
 (defun agent-shell-manager--status-face (status)
@@ -887,10 +908,17 @@ If `agent-shell-manager-transient' is non-nil, hide the manager window."
                     (progn
                       (set-window-buffer agent-shell-window buffer)
                       (select-window agent-shell-window))
-                  (agent-shell--display-buffer buffer))))
+                  (agent-shell-manager--display-shell buffer))))
               (unless switched-persp
                 (agent-shell-manager--hide-window)))))
       (user-error "Buffer no longer exists"))))
+
+(defun agent-shell-manager--display-shell (buffer)
+  "Select a window showing BUFFER, displaying it the way agent-shell would.
+Uses the public `agent-shell-display-action'."
+  (if-let* ((win (get-buffer-window buffer)))
+      (select-window win)
+    (select-window (display-buffer buffer agent-shell-display-action))))
 
 (defun agent-shell-manager-peek ()
   "Display the agent-shell buffer at point without switching focus.
@@ -934,13 +962,10 @@ Scrolls the displayed buffer to the latest output."
       (user-error "Buffer no longer exists"))
     (when (yes-or-no-p (format "Kill agent-shell process in %s? " (buffer-name buffer)))
       (with-current-buffer buffer
-        (when (and (boundp 'agent-shell--state)
-                   (map-elt agent-shell--state :client)
-                   (map-nested-elt agent-shell--state '(:client :process)))
-          (let ((proc (map-nested-elt agent-shell--state '(:client :process))))
-            (when (process-live-p proc)
-              (comint-send-eof)
-              (message "Sent EOF to agent-shell process in %s" (buffer-name buffer))))))
+        (when (agent-shell-manager--process-alive-p
+               (agent-shell-manager--agent-process buffer))
+          (comint-send-eof)
+          (message "Sent EOF to agent-shell process in %s" (buffer-name buffer))))
       (run-with-timer 0.1 nil #'agent-shell-manager-refresh))))
 
 (defun agent-shell-manager-new ()
@@ -982,13 +1007,9 @@ in the target frame and keeps focus in the manager."
     (let ((config (agent-shell-manager--get-buffer-config buffer))
           (buffer-name (buffer-name buffer)))
       (when (yes-or-no-p (format "Restart agent-shell %s? " buffer-name))
-        (with-current-buffer buffer
-          (when (and (boundp 'agent-shell--state)
-                     (map-elt agent-shell--state :client)
-                     (map-nested-elt agent-shell--state '(:client :process)))
-            (let ((proc (map-nested-elt agent-shell--state '(:client :process))))
-              (when (process-live-p proc)
-                (kill-process proc)))))
+        (let ((proc (agent-shell-manager--agent-process buffer)))
+          (when (agent-shell-manager--process-alive-p proc)
+            (kill-process proc)))
         (kill-buffer buffer)
         (if config
             (agent-shell-start :config config)
