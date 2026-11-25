@@ -111,10 +111,6 @@ Automatically set to the previously-active frame when
     map)
   "Keymap for `agent-shell-manager-mode'.")
 
-(with-eval-after-load 'evil
-  (evil-define-key 'normal agent-shell-manager-mode-map
-    "n" #'agent-shell-manager-set-label))
-
 (defvar-local agent-shell-manager--refresh-timer nil
   "Timer for auto-refreshing the buffer list.")
 
