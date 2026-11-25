@@ -77,4 +77,34 @@
              (lambda (&rest _) (error "Several options share category"))))
     (should-not (agent-shell-manager--option-name (current-buffer) "model"))))
 
+;;; "Needs you" column and filter
+
+(ert-deftest agent-shell-manager-default-attention-flags-waiting ()
+  "Without a configured source, only chats waiting on permissions need you."
+  (cl-letf (((symbol-function 'agent-shell-manager--get-status)
+             (lambda (b) (if (eq b 'w) "waiting" "ready")))
+            ((symbol-function 'agent-shell-manager--pending-permission-count)
+             (lambda (_) 2)))
+    (should (equal (agent-shell-manager--default-attention 'w)
+                   '(0 . "waiting: approval (2)")))
+    (should-not (agent-shell-manager--default-attention 'r))))
+
+(ert-deftest agent-shell-manager-needs-group-orders-by-rank ()
+  "The Needs me view keeps only chats that need you, in rank order."
+  (let ((agent-shell-manager-attention-function
+         (lambda (b) (pcase b ('a '(2 . "finished, unread"))
+                       ('b '(0 . "waiting: approval"))
+                       ('c nil)
+                       ('d '(1 . "waiting: question"))))))
+    (should (equal (mapcar #'car (agent-shell-manager--needs-entries
+                                  (list (list 'a []) (list 'b []) (list 'c []) (list 'd []))))
+                   '(b d a)))))
+
+(ert-deftest agent-shell-manager-needs-cell-text ()
+  (let ((agent-shell-manager-attention-function
+         (lambda (b) (and (eq b 'a) '(0 . "1 waiting: approval")))))
+    (should (equal (substring-no-properties (agent-shell-manager--needs-cell 'a))
+                   "1 waiting: approval"))
+    (should (equal (agent-shell-manager--needs-cell 'z) ""))))
+
 ;;; agent-shell-manager-test.el ends here

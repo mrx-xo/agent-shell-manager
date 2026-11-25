@@ -187,8 +187,51 @@ A nil or empty label clears it.  Pair it with
 (defvar agent-shell-manager-filter-status nil
   "Current status filter. nil = show all.")
 
-(defvar agent-shell-manager-filter-cycle '(nil "Working" "Waiting" "Ready" "Killed")
-  "Cycle of filter values. nil means show all.")
+(defvar agent-shell-manager-filter-cycle '(nil "Needs me" "Working" "Waiting" "Ready" "Killed")
+  "Cycle of filter values. nil means show all.
+\"Needs me\" shows only chats with a `agent-shell-manager-attention-function'
+entry, as one group in that function's order.")
+
+;; ============================================================
+;; Needs you
+;; ============================================================
+
+(defun agent-shell-manager--default-attention (buffer)
+  "Return (RANK . TEXT) when BUFFER waits on a permission, else nil."
+  (when (equal (agent-shell-manager--get-status buffer) "waiting")
+    (let ((count (agent-shell-manager--pending-permission-count buffer)))
+      (cons 0 (if (> count 1)
+                  (format "waiting: approval (%d)" count)
+                "waiting: approval")))))
+
+(defcustom agent-shell-manager-attention-function
+  #'agent-shell-manager--default-attention
+  "Function called with a buffer; returns nil or (RANK . TEXT).
+Non-nil means the chat needs you: TEXT fills the Needs you column and
+RANK (lower first) orders the \"Needs me\" filter.  The default only
+flags chats waiting on a permission; point it at another package's
+attention queue to show finished-unread chats and questions too."
+  :type 'function
+  :group 'agent-shell-manager)
+
+(defun agent-shell-manager--needs-cell (buffer)
+  "Return the Needs you column text for BUFFER, or \"\"."
+  (if-let* ((entry (funcall agent-shell-manager-attention-function buffer))
+            (text (cdr entry)))
+      (propertize text 'face (if (string-prefix-p "waiting" (replace-regexp-in-string
+                                                             "^[0-9]+ " "" text))
+                                 'warning
+                               'success))
+    ""))
+
+(defun agent-shell-manager--needs-entries (entries)
+  "Return the ENTRIES whose buffer needs you, ordered by rank."
+  (let ((ranked (delq nil (mapcar (lambda (entry)
+                                    (when-let* ((att (funcall agent-shell-manager-attention-function
+                                                              (car entry))))
+                                      (cons (car att) entry)))
+                                  entries))))
+    (mapcar #'cdr (sort ranked (lambda (a b) (< (car a) (car b)))))))
 
 ;; ============================================================
 ;; Mode Definition
@@ -203,7 +246,7 @@ A nil or empty label clears it.  Pair it with
          ("Status" 15 t)
          ("Mode" 15 t)
          ("Model" 21 t)
-         ("Pending Permissions" 20 t)
+         ("Needs you" 24 t)
          ("Path" 20 t)])
   (setq tabulated-list-padding 2)
   (setq tabulated-list-groups #'agent-shell-manager--groups)
@@ -451,13 +494,14 @@ Applies status filtering. Killed buffers sort to bottom within each group."
                             (status (agent-shell-manager--get-combined-status buffer))
                             (mode (agent-shell-manager--get-session-mode buffer))
                             (model (agent-shell-manager--get-model-id buffer))
-                            (perms (agent-shell-manager--count-pending-permissions buffer))
+                            (needs (agent-shell-manager--needs-cell buffer))
                             (path (abbreviate-file-name (agent-shell-manager--get-cwd buffer))))
                        (list buffer
-                             (vector display-name status mode model perms path))))
+                             (vector display-name status mode model needs path))))
                    buffers))
+         (needs-view (equal agent-shell-manager-filter-status "Needs me"))
          ;; Apply status filter
-         (entries (if agent-shell-manager-filter-status
+         (entries (if (and agent-shell-manager-filter-status (not needs-view))
                       (seq-filter
                        (lambda (entry)
                          (let ((status (substring-no-properties (aref (cadr entry) 1))))
@@ -466,6 +510,12 @@ Applies status filtering. Killed buffers sort to bottom within each group."
                     entries))
          ;; Group by project root
          (groups (make-hash-table :test #'equal)))
+    (if needs-view
+        (let ((needs (agent-shell-manager--needs-entries entries)))
+          (and needs
+               (list (list (propertize " Needs you, in SPC c j order "
+                                       'face 'font-lock-comment-face)
+                           needs))))
     ;; Bucket entries by project
     (dolist (entry entries)
       (let* ((buffer (car entry))
@@ -495,7 +545,7 @@ Applies status filtering. Killed buffers sort to bottom within each group."
            (push (cons name group-entries) result)))
        groups)
       ;; Sort groups alphabetically by project path
-      (sort result (lambda (a b) (string< (car a) (car b)))))))
+      (sort result (lambda (a b) (string< (car a) (car b))))))))
 
 (defun agent-shell-manager--skip-group-headers ()
   "Post-command-hook to skip cursor past group header lines.
